@@ -1,0 +1,190 @@
+---
+title: "Streammetabolizer vingette: Simulate dissolved oxygen data from metabolism data"
+author: "USGS-R -> KAL"
+date: "2025-04-17"
+
+output:
+   html_document:
+    theme: simplex
+    highlight: tango
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style type="text/css">
+body, td {font-size: 13px;}
+code.r{font-size: 9px;}
+pre {font-size: 11px}
+</style>
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = F, message = F)
+knitr::opts_knit$set(root.dir = '/Users/kellyloria/Documents/Publications/')
+def.chunk.hook  <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- def.chunk.hook(x, options)
+  ifelse(options$size != "normalsize", paste0("\n \\", options$size,"\n\n", x, "\n\n \\normalsize"), x)
+})
+```
+
+
+```{r, echo = F, message = F, include=FALSE}
+### Packages
+lapply(c("dplyr","ggplot2", "lubridate","tidyverse", "streamMetabolizer", "patchwork"), require, character.only=T)
+```
+
+
+## This builds off the existing vinegette for metabolism data simulation
+
+Available here: https://rdrr.io/github/USGS-R/streamMetabolizer/man/metab_sim.html
+
+
+### Nothing new here. 
+Just creating to help understand streamMetabolizer's built in simulation examples.
+
+
+
+### 1. Simulations with variation all at sub-daily scale
+
+Prepare input data (DO used only to pick first DO of each day)
+
+```{r, echo = T, message = F, include=T}
+dat <- data_metab('10', res='15')
+head(dat)
+```
+
+Where site '10' is a built in example and the temporal resolution is 15 muinutes
+
+#### Create true metabolism estimates:
+
+GPP = 3, ER = –4, K600 = 19
+
+```{r, echo = T, message = F, include=T}
+
+dat_daily <- data.frame(date=as.Date(paste0("2012-09-", 18:20)),
+                        GPP.daily=3, ER.daily=-4, K600.daily=19, stringsAsFactors=FALSE)
+
+head(dat_daily)
+```
+
+
+#### Set up simulation model
+
+metab_sim {streamMetabolizer}
+Takes input data in the form of a sub-daily time series (data) of DO.sat, depth, temperature, and light, and a daily time series (data_daily) of GPP, ER, and K600 values, and turns these into simulated DO.obs. Either data or data_daily should specify a starting DO.obs value for each day; if in data, this takes the form of a DO.obs column with values on at least the first time point of each day (all other values are ignored), or if in data_daily, this takes the form of a DO.mod.1 column with one starting DO value per day.
+
+```{r, echo = T, message = F, include=T}
+# define simulation parameters
+mm <- metab_sim(
+  specs(mm_name('sim'), err_obs_sigma=0.1, err_proc_sigma=2,
+        GPP_daily=NULL, ER_daily=NULL, K600_daily=NULL),
+  data=dat, data_daily=dat_daily)
+
+get_params(mm)
+```
+
+#### Metab estimates are for data without errors:
+
+```{r, echo = T, message = F, include=T}
+
+# Returns the true parameters (GPP, ER, K600) used for simulation
+predict_metab(mm) 
+```
+
+```{r, echo = T, message = F, include=T}
+# Estimates metabolism based on noise-free DO simulation (returns same values as data_daily).
+predict_DO(mm)[seq(1,50,by=10),]
+```
+
+#### Start simulation: 
+
+Actual simulation called by predict_DO()
+
+```{r, echo = T, message = F, include=T}
+
+mm@specs$sim_seed <- 236
+predict_DO(mm)$DO.obs[seq(1,50,by=10)]
+
+# different each time (?) -is it?
+predict_DO(mm)$DO.obs[seq(1,50,by=10)]
+
+```
+
+
+### 2. Simulation with a light-saturation
+
+Defines GPP using the light saturation function:
+GPP = Pmax * tanh(alpha * light)
+
+```{r, echo = T, message = F, include=T}
+
+# fancy GPP equation
+dat_daily <- data.frame(
+  date = as.Date(paste0("2012-09-", 18:20)),
+  Pmax = 8,
+  alpha = 0.01,
+  ER.daily = -4,
+  K600.daily = 19,
+  stringsAsFactors = FALSE
+)
+
+head(dat_daily)
+```
+
+Sets up simulation with GPP_fun='satlight' and pulls Pmax/alpha from data_daily.
+
+```{r, echo = T, message = F, include=T}
+mm <- metab_sim(
+  specs(mm_name('sim', GPP_fun='satlight'), err_obs_sigma=0.1, err_proc_sigma=2,
+        Pmax=NULL, alpha=NULL, ER_daily=NULL, K600_daily=NULL),
+  data=dat, data_daily=dat_daily)
+```
+
+### 3. Simulation with sub-daily and multi-day variability
+
+```{r, echo = T, message = F, include=T}
+
+sp <- specs(mm_name('sim', pool_K600='none'),
+            K600_daily = function(n, ...) pmax(0, rnorm(n, 10, 3)))
+
+mm <- metab(sp, dat)
+get_params(mm)
+predict_metab(mm) # metab estimates are for data without errors
+predict_DO(mm)[seq(1,50,by=10),]
+
+```
+
+### 4. Simulation with K~Q relationship
+
+```{r, echo = T, message = F, include=T}
+dat <- data_metab('10','15')
+sp <- specs(mm_name('sim', pool_K600='binned'))
+mm <- metab(sp, dat)
+pars <- get_params(mm)
+attr(pars, 'K600_eqn')
+
+```
+#### Visualize:
+
+
+Simulated DO (no error) - This shows the ideal DO signal, not influenced by any simulated noise.
+
+Noise in DO.obs - plot includes observation + process errors.
+
+
+```{r, echo = T, message = F, include=T}
+# Plot the underlying "true" DO signal (no error)
+p_truth <- plot_DO_preds(mm) + ggtitle("Simulated DO (no error)")
+
+# Plot the modeled predictions vs. noisy DO.obs
+p_noisy <- plot_DO_preds(predict_DO(mm)) + ggtitle("Noise in DO.obs")
+
+p_truth + p_noisy
+
+```
+

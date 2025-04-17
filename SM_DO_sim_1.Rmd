@@ -1,0 +1,564 @@
+---
+title: "Draft: Simulate DO data based on metabolism, then mess with that data to create case study examples"
+author: "KAL"
+date: "2025-04-17"
+
+output:
+   html_document:
+    theme: simplex
+    highlight: tango
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style type="text/css">
+body, td {font-size: 13px;}
+code.r{font-size: 9px;}
+pre {font-size: 11px}
+</style>
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = F, message = F)
+knitr::opts_knit$set(root.dir = '/Users/kellyloria/Documents/Publications/')
+def.chunk.hook  <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- def.chunk.hook(x, options)
+  ifelse(options$size != "normalsize", paste0("\n \\", options$size,"\n\n", x, "\n\n \\normalsize"), x)
+})
+```
+
+
+```{r, echo = F, message = F, include=FALSE}
+### Packages
+lapply(c("dplyr","ggplot2", "lubridate","tidyverse", "streamMetabolizer", "patchwork","ggpubr"), require, character.only=T)
+```
+
+
+#### Again, this builds off the existing vinegette for metabolism data simulation
+
+Available here: https://rdrr.io/github/USGS-R/streamMetabolizer/man/metab_sim.html
+
+
+### Part 1: 
+Simulate metabolism and sub-daily DO for the baseline 'true' metabolism regime, and modeled parameter estimates using the bayes model to model the 'true' metabolic state. 
+
+#### STEP 1: Create the "true" daily metabolism values
+
+```{r, echo = T, message = F, include=T}
+
+set.seed(123)  # for reproducibility
+
+dat_daily_T <- data.frame(
+  date = seq(as.Date("2012-09-18"), as.Date("2012-09-28"), by = "1 day"),
+  GPP.daily = round(rnorm(11, mean = 3, sd = 0.5),3), # some wobble
+  ER.daily = round(rnorm(11, mean = -4, sd = 0.5),3),
+  K600.daily = round(rnorm(11, mean = 21, sd = 0.01),2), # less wobble, could fix constant
+  stringsAsFactors = FALSE
+)
+
+dat_daily_T
+
+```
+
+#### STEP 2: Get a 'true' sub-daily dataset structure
+
+Start with metaboilizer's built in example: 
+
+```{r, echo = T, message = F, include=T}
+dat <- data_metab('10', res = '15') 
+head(dat)
+```
+
+#### STEP 3: Simulate DO.obs using metab_sim
+
+with some observation and process error
+
+```{r, echo = T, message = F, include=T}
+?metab_sim()
+
+specs_sim <- specs(mm_name('sim'), err_obs_sigma=0.1, err_proc_sigma=2)
+
+mm_sim <- metab_sim(
+  specs = specs_sim,
+  data = dat,
+  data_daily = dat_daily_T
+)
+
+# Save simulated DO.obs
+sim_do <- predict_DO(mm_sim)
+
+head(sim_do)
+```
+
+
+#### STEP 4: Replace DO.obs in original data with simulated values
+
+```{r, echo = T, message = F, include=T}
+dat_simulated <- dat %>%
+  select(-DO.obs) %>%
+  left_join(sim_do[, c("solar.time", "DO.obs")], by = "solar.time")
+
+head(dat_simulated)
+```
+
+
+#### STEP 5: Fit bayes model to the simulated data
+
+```{r, echo = T, message = F, include=T}
+
+specs_fit <- specs(mm_name('bayes', err_proc_iid = FALSE),
+                   n_cores = 2, n_chains = 2, burnin_steps = 200, saved_steps = 100)
+
+mm_fit <- metab(specs = specs_fit, data = dat_simulated)
+params <- get_params(mm_fit)
+
+```
+
+##### Quick check model preformance
+
+```{r, echo = F, message = F, include=F}
+# extract fit:
+T_mm_fit <- get_fit(mm_fit)
+T_mm_fit
+```
+
+```{r, echo = T, message = F, include=T}
+DOplot <-plot_DO_preds(predict_DO(mm_fit))
+DOplot
+```
+
+
+```{r, echo = T, message = F, include=T}
+metabplot<- plot_metab_preds(predict_metab(mm_fit))
+metabplot
+```
+#### Convergence? 
+
+```{r, echo = T, message = F, include=T}
+get_fit(mm_fit)$overall %>%
+  dplyr::select(ends_with('Rhat'))
+```
+
+#### STEP 6: Compare recovered values to the "true" ones
+
+Aggregate sub daily do simulation with "true" metabolism regime into "true_df" 
+
+```{r, echo = T, message = F, include=T}
+true_df <- sim_do %>%
+  left_join(dat_daily_T) %>%
+  rename(GPP.true = GPP.daily, ER.true = ER.daily, K600.true = K600.daily)
+```
+
+Get model estimates of true metabolism parameters to see how well bayes model recovered intial estimates through RMSE
+
+```{r, echo = T, message = F, include=T}
+estimates <- params %>%
+  rename(GPP.est = GPP.daily, ER.est = ER.daily, K600.est = K600.daily)
+
+comp_df <- dat_daily_T %>%
+  rename(GPP.true = GPP.daily, ER.true = ER.daily, K600.true = K600.daily)%>%
+  left_join(estimates, by=c("date"))
+```
+
+#### Visualize:
+
+How the modeled parameter estimates vary from the 'true' simulated metabolism regime to get baseline variation before creating other DO scenarios. 
+
+
+```{r, echo = F, message = F, include=F, warning=F}
+GPP_plot <- comp_df %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = GPP.true, color = "True")) +
+  geom_point(aes(y = GPP.true, color = "True")) +
+
+  # Estimated GPP
+  geom_ribbon(aes(ymin = GPP.est - GPP.daily.sd,
+                  ymax = GPP.est + GPP.daily.sd,
+                  fill = "Modeled"),
+              alpha = 0.2) +
+  geom_line(aes(y = GPP.est, color = "Modeled")) +
+  geom_point(aes(y = GPP.est, color = "Modeled")) +
+
+  # Customize colors and labels
+  scale_color_manual(name = "GPP Type",
+                     values = c("True" = "darkgreen", "Modeled" = "goldenrod")) +
+  scale_fill_manual(name = "GPP Type",
+                    values = c("True" = "darkgreen", "Modeled" = "goldenrod")) +
+
+  theme_bw() +
+  ylab(expression(GPP~(g~O[2]~m^-2~d^-1)))
+
+```
+
+```{r, echo = T, message = F, include=T, warning=F}
+fits <- comp_df%>% 
+  group_by(date)%>%
+  summarize(rmse = sqrt(mean((GPP.true-GPP.est)^2)),
+              sd = sd(GPP.true),
+              min = min(GPP.true, na.rm = T),
+              max = max(GPP.true, na.rm = T),
+              range = range(max-min, na.rm = T),
+              nrmse = rmse/range)
+```
+
+```{r, echo = F, message = F, include=F, warning=F}
+
+rmsehist_gpp <- ggplot(fits, aes(x = rmse)) +
+  geom_histogram(aes(fill = ..x..), bins = 30) +
+  scale_fill_gradient(low = "lightblue", high = "darkred") +
+  theme_minimal() +
+  labs(fill = "RMSE")
+
+```
+
+
+
+
+```{r, echo = F, message = F, include=F, warning=F}
+ER_plot <- comp_df %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = ER.true, color = "True")) +
+  geom_point(aes(y = ER.true, color = "True")) +
+
+  # Estimated ER
+  geom_ribbon(aes(ymin = ER.est - ER.daily.sd,
+                  ymax = ER.est + ER.daily.sd,
+                  fill = "Modeled"),
+              alpha = 0.2) +
+  geom_line(aes(y = ER.est, color = "Modeled")) +
+  geom_point(aes(y = ER.est, color = "Modeled")) +
+
+  # Customize colors and labels
+  scale_color_manual(name = "ER Type",
+                     values = c("True" = "purple4", "Modeled" = "goldenrod")) +
+  scale_fill_manual(name = "ER Type",
+                    values = c("True" = "purple4", "Modeled" = "goldenrod")) +
+
+  theme_bw() +
+  ylab(expression(ER~(g~O[2]~m^-2~d^-1)))
+
+```
+
+```{r, echo = F, message = F, include=T, warning=F}
+fits <- comp_df%>% 
+  group_by(date)%>%
+  summarize(rmse = sqrt(mean((ER.true-ER.est)^2)),
+              sd = sd(ER.true),
+              min = min(ER.true, na.rm = T),
+              max = max(ER.true, na.rm = T),
+              range = range(max-min, na.rm = T),
+              nrmse = rmse/range)
+```
+
+```{r, echo = F, message = F, include=F, warning=F}
+
+rmsehist_ER <- ggplot(fits, aes(x = rmse)) +
+  geom_histogram(aes(fill = ..x..), bins = 30) +
+  scale_fill_gradient(low = "lightblue", high = "darkred") +
+  theme_minimal() +
+  labs(fill = "RMSE")
+
+```
+
+
+```{r, echo = F, message = F, include=F, warning=F}
+K600_plot <- comp_df %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = K600.true, color = "True")) +
+  geom_point(aes(y = K600.true, color = "True")) +
+
+  # Estimated K600
+  geom_ribbon(aes(ymin = K600.est - K600.daily.sd,
+                  ymax = K600.est + K600.daily.sd,
+                  fill = "Modeled"),
+              alpha = 0.2) +
+  geom_line(aes(y = K600.est, color = "Modeled")) +
+  geom_point(aes(y = K600.est, color = "Modeled")) +
+
+  # Customize colors and labels
+  scale_color_manual(name = "K600 Type",
+                     values = c("True" = "steelblue3", "Modeled" = "goldenrod")) +
+  scale_fill_manual(name = "K600 Type",
+                    values = c("True" = "steelblue3", "Modeled" = "goldenrod")) +
+
+  theme_bw() +
+  ylab(expression(K600~(g~O[2]~m^-2~d^-1)))
+
+```
+
+```{r, echo = F, message = F, include=T, warning=F}
+fits <- comp_df%>% 
+  group_by(date)%>%
+  summarize(rmse = sqrt(mean((K600.true-K600.est)^2)),
+              sd = sd(K600.true),
+              min = min(K600.true, na.rm = T),
+              max = max(K600.true, na.rm = T),
+              range = range(max-min, na.rm = T),
+              nrmse = rmse/range)
+```
+
+```{r, echo = F, message = F, include=F, warning=F}
+
+rmsehist_K600 <- ggplot(fits, aes(x = rmse)) +
+  geom_histogram(aes(fill = ..x..), bins = 30) +
+  scale_fill_gradient(low = "lightblue", high = "darkred") +
+  theme_minimal() +
+  labs(fill = "RMSE")
+
+```
+
+```{r, echo = F, message = F, include=T}
+ggarrange(
+  GPP_plot,
+  rmsehist_gpp, 
+  ER_plot,
+  rmsehist_ER, 
+  K600_plot,
+  rmsehist_K600,
+  ncol = 2, nrow = 3,
+  widths = c(0.7, 0.3),
+  common.legend = T,
+  align=c("v")
+)
+```
+
+
+
+
+
+### Part 2: 
+Wrong calibration example, same mini DOs one has static offset (-0.12), one doesn't the true simulated data is still the true data. 
+
+
+#### STEP 1: 
+ 
+```{r, echo = T, message = F, include=T}
+dat_simulated_cal <- dat_simulated %>%
+  mutate(DO.obs = DO.obs - 0.12)
+
+head(dat_simulated_cal)
+```
+
+
+
+#### STEP 2: Fit bayes model to the calibration offset data
+
+```{r, echo = T, message = F, include=T}
+mm_fit_cal <- metab(specs = specs_fit, data = dat_simulated_cal)
+params_cal <- get_params(mm_fit_cal)
+```
+
+##### Quick check model preformance
+
+```{r, echo = F, message = F, include=F}
+# extract fit:
+Cal_mm_fit <- get_fit(mm_fit_cal)
+Cal_mm_fit
+```
+
+```{r, echo = F, message = F, include=F}
+DOplot <-plot_DO_preds(predict_DO(mm_fit_cal))
+DOplot
+```
+
+
+```{r, echo = F, message = F, include=F}
+metabplot<- plot_metab_preds(predict_metab(mm_fit_cal))
+metabplot
+```
+#### Convergence? 
+
+```{r, echo = F, message = F, include=F}
+get_fit(mm_fit_cal)$overall %>%
+  dplyr::select(ends_with('Rhat'))
+```
+
+#### STEP 3: Compare recovered values to the "true" ones
+
+Aggregate sub daily do simulation with "true" metabolism regime into "true_df" 
+
+```{r, echo = T, message = F, include=T}
+true_df <- sim_do %>%
+  left_join(dat_daily_T) %>%
+  rename(GPP.true = GPP.daily, ER.true = ER.daily, K600.true = K600.daily)
+```
+
+Get model estimates of true metabolism parameters to see how well bayes model recovered intial estimates through RMSE
+
+```{r, echo = T, message = F, include=T}
+estimates <- params_cal %>%
+  rename(GPP.est = GPP.daily, ER.est = ER.daily, K600.est = K600.daily)
+
+comp_df <- dat_daily_T %>%
+  rename(GPP.true = GPP.daily, ER.true = ER.daily, K600.true = K600.daily)%>%
+  left_join(estimates, by=c("date"))
+```
+
+#### Visualize:
+
+How the modeled parameter estimates vary from the 'true' simulated metabolism regime to get baseline variation before creating other DO scenarios. 
+
+
+```{r, echo = F, message = F, include=F, warning=F}
+GPP_plot <- comp_df %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = GPP.true, color = "True")) +
+  geom_point(aes(y = GPP.true, color = "True")) +
+
+  # Estimated GPP
+  geom_ribbon(aes(ymin = GPP.est - GPP.daily.sd,
+                  ymax = GPP.est + GPP.daily.sd,
+                  fill = "Modeled"),
+              alpha = 0.2) +
+  geom_line(aes(y = GPP.est, color = "Modeled")) +
+  geom_point(aes(y = GPP.est, color = "Modeled")) +
+
+  # Customize colors and labels
+  scale_color_manual(name = "GPP Type",
+                     values = c("True" = "darkgreen", "Modeled" = "goldenrod")) +
+  scale_fill_manual(name = "GPP Type",
+                    values = c("True" = "darkgreen", "Modeled" = "goldenrod")) +
+
+  theme_bw() +
+  ylab(expression(GPP~(g~O[2]~m^-2~d^-1)))
+
+```
+
+```{r, echo = T, message = F, include=T, warning=F}
+fits <- comp_df%>% 
+  group_by(date)%>%
+  summarize(rmse = sqrt(mean((GPP.true-GPP.est)^2)),
+              sd = sd(GPP.true),
+              min = min(GPP.true, na.rm = T),
+              max = max(GPP.true, na.rm = T),
+              range = range(max-min, na.rm = T),
+              nrmse = rmse/range)
+```
+
+```{r, echo = F, message = F, include=F, warning=F}
+
+rmsehist_gpp <- ggplot(fits, aes(x = rmse)) +
+  geom_histogram(aes(fill = ..x..), bins = 30) +
+  scale_fill_gradient(low = "lightblue", high = "darkred") +
+  theme_minimal() +
+  labs(fill = "RMSE")
+
+```
+
+
+
+
+```{r, echo = F, message = F, include=F, warning=F}
+ER_plot <- comp_df %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = ER.true, color = "True")) +
+  geom_point(aes(y = ER.true, color = "True")) +
+
+  # Estimated ER
+  geom_ribbon(aes(ymin = ER.est - ER.daily.sd,
+                  ymax = ER.est + ER.daily.sd,
+                  fill = "Modeled"),
+              alpha = 0.2) +
+  geom_line(aes(y = ER.est, color = "Modeled")) +
+  geom_point(aes(y = ER.est, color = "Modeled")) +
+
+  # Customize colors and labels
+  scale_color_manual(name = "ER Type",
+                     values = c("True" = "purple4", "Modeled" = "goldenrod")) +
+  scale_fill_manual(name = "ER Type",
+                    values = c("True" = "purple4", "Modeled" = "goldenrod")) +
+
+  theme_bw() +
+  ylab(expression(ER~(g~O[2]~m^-2~d^-1)))
+
+```
+
+```{r, echo = F, message = F, include=T, warning=F}
+fits <- comp_df%>% 
+  group_by(date)%>%
+  summarize(rmse = sqrt(mean((ER.true-ER.est)^2)),
+              sd = sd(ER.true),
+              min = min(ER.true, na.rm = T),
+              max = max(ER.true, na.rm = T),
+              range = range(max-min, na.rm = T),
+              nrmse = rmse/range)
+```
+
+```{r, echo = F, message = F, include=F, warning=F}
+
+rmsehist_ER <- ggplot(fits, aes(x = rmse)) +
+  geom_histogram(aes(fill = ..x..), bins = 30) +
+  scale_fill_gradient(low = "lightblue", high = "darkred") +
+  theme_minimal() +
+  labs(fill = "RMSE")
+
+```
+
+
+```{r, echo = F, message = F, include=F, warning=F}
+K600_plot <- comp_df %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = K600.true, color = "True")) +
+  geom_point(aes(y = K600.true, color = "True")) +
+
+  # Estimated K600
+  geom_ribbon(aes(ymin = K600.est - K600.daily.sd,
+                  ymax = K600.est + K600.daily.sd,
+                  fill = "Modeled"),
+              alpha = 0.2) +
+  geom_line(aes(y = K600.est, color = "Modeled")) +
+  geom_point(aes(y = K600.est, color = "Modeled")) +
+
+  # Customize colors and labels
+  scale_color_manual(name = "K600 Type",
+                     values = c("True" = "steelblue3", "Modeled" = "goldenrod")) +
+  scale_fill_manual(name = "K600 Type",
+                    values = c("True" = "steelblue3", "Modeled" = "goldenrod")) +
+
+  theme_bw() +
+  ylab(expression(K600~(g~O[2]~m^-2~d^-1)))
+
+```
+
+```{r, echo = F, message = F, include=T, warning=F}
+fits <- comp_df%>% 
+  group_by(date)%>%
+  summarize(rmse = sqrt(mean((K600.true-K600.est)^2)),
+              sd = sd(K600.true),
+              min = min(K600.true, na.rm = T),
+              max = max(K600.true, na.rm = T),
+              range = range(max-min, na.rm = T),
+              nrmse = rmse/range)
+```
+
+```{r, echo = F, message = F, include=F, warning=F}
+
+rmsehist_K600 <- ggplot(fits, aes(x = rmse)) +
+  geom_histogram(aes(fill = ..x..), bins = 30) +
+  scale_fill_gradient(low = "lightblue", high = "darkred") +
+  theme_minimal() +
+  labs(fill = "RMSE")
+
+```
+
+```{r, echo = F, message = F, include=T}
+ggarrange(
+  GPP_plot,
+  rmsehist_gpp, 
+  ER_plot,
+  rmsehist_ER, 
+  K600_plot,
+  rmsehist_K600,
+  ncol = 2, nrow = 3,
+  widths = c(0.7, 0.3),
+  common.legend = T,
+  align=c("v")
+)
+```
+
+
